@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { Download, Plus, Minus, RefreshCw, Settings, Trophy, Timer, Undo2 } from "lucide-react";
+import { Download, Plus, Minus, RefreshCw, Settings, Trophy, Timer, Undo2, Send } from "lucide-react";
 
 // Minimal UI helpers
 function Button({ children, className = "", ...props }) {
@@ -30,6 +30,7 @@ const DEFAULTS = {
   },
 };
 
+// Local storage helper
 function useLocalStorage(key, initial) {
   const [state, setState] = useState(() => {
     try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : initial; } catch { return initial; }
@@ -38,9 +39,11 @@ function useLocalStorage(key, initial) {
   return [state, setState];
 }
 
+// CSV helpers
 function csvEscape(v){const s=String(v??"");return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s}
 function downloadCSV(filename, rows){const csv=rows.map(r=>r.map(csvEscape).join(",")).join("\n");const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url)}
 
+// Scoring for a single end
 function scoreEnd(end, cfg){
   const S = cfg.scoring;
   let a = 0, b = 0; const detail = [];
@@ -65,6 +68,19 @@ function scoreEnd(end, cfg){
   return { a, b, detail: detail.join('; '), ultimate };
 }
 
+// Build CSV rows from match
+function buildCSVRows(teams, ends, cfg){
+  const header=["End","A touchers","B touchers","Crossover shot","1st","2nd","3rd","Adj A","Adj B","Notes",`${teams.A} pts`,`${teams.B} pts`,`Detail`];
+  const rows=[header];
+  const totals = ends.reduce((acc,e)=>{const r=scoreEnd(e,cfg);acc.a+=r.a;acc.b+=r.b;return acc},{a:0,b:0});
+  ends.forEach(e=>{const r=scoreEnd(e,cfg);rows.push([e.number,e.aTouchers,e.bTouchers,e.crossoverShot||'',e.first||'',e.second||'',e.third||'',e.adjA||0,e.adjB||0,e.notes||'',r.a,r.b,r.detail])});
+  rows.push(["Totals","","","","","","","","","",String(totals.a),String(totals.b),""]);
+  return rows;
+}
+function rowsToCSV(rows){
+  return rows.map(r=>r.map(csvEscape).join(",")).join("\n");
+}
+
 export default function App(){
   const [teams, setTeams] = useLocalStorage('jackattack.teams', { A: 'Team A', B: 'Team B' });
   const [cfg, setCfg] = useLocalStorage('jackattack.cfg', DEFAULTS);
@@ -72,15 +88,44 @@ export default function App(){
   const [ends, setEnds] = useLocalStorage('jackattack.ends', []);
   const [history, setHistory] = useState([]);
 
+  // match timer
   useEffect(()=>{const id=setInterval(()=>setMeta(m=>({...m,timerSec:m.timerSec+1})),1000);return()=>clearInterval(id)},[]);
   const timeStr = useMemo(()=>{const s=meta.timerSec;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;const pad=x=>String(x).padStart(2,'0');return `${pad(h)}:${pad(m)}:${pad(sec)}`},[meta.timerSec]);
 
-  const totals = useMemo(()=>ends.reduce((acc,e)=>{const r=scoreEnd(e,cfg);acc.a+=r.a;acc.b+=r.b;return acc},{a:0,b:0}),[ends,cfg]);
+  // totals
+  const totals = useMemo(
+    () => ends.reduce((acc,e)=>{const r=scoreEnd(e,cfg);acc.a+=r.a;acc.b+=r.b;return acc},{a:0,b:0}),
+    [ends,cfg]
+  );
 
+  // COMPLETE & SEND — emails CSV via serverless function
+  async function sendDirect(){
+    const to = "jackattackfarley@gmail.com"; // fixed recipient
+    const rows = buildCSVRows(teams, ends, cfg);
+    const csv = rowsToCSV(rows);
+    const subject = `Final score: ${teams.A} vs ${teams.B}`;
+    const filename = `jackattack_${teams.A}_vs_${teams.B}.csv`.replace(/\s+/g,'_');
+
+    try {
+      const resp = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to, subject, csv, filename })
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data?.error || 'Send failed');
+      alert('Email sent! Check the inbox.');
+    } catch (e) {
+      alert('Send failed: ' + (e?.message || 'Unknown error'));
+    }
+  }
+
+  // history helpers
   function pushHistory(){setHistory(h=>[...h,{teams:JSON.stringify(teams),cfg:JSON.stringify(cfg),meta:JSON.stringify(meta),ends:JSON.stringify(ends)}].slice(-50))}
   function undo(){const last=history[history.length-1];if(!last)return;setHistory(history.slice(0,-1));setTeams(JSON.parse(last.teams));setCfg(JSON.parse(last.cfg));setMeta(JSON.parse(last.meta));setEnds(JSON.parse(last.ends));}
   function reset(){if(!confirm('Reset match?'))return;pushHistory();setTeams({A:'Team A',B:'Team B'});setCfg(DEFAULTS);setMeta({ends:DEFAULTS.ends,timerSec:0});setEnds([])}
 
+  // end editing
   function addEnd(){pushHistory();setEnds([...ends,{
     number: ends.length+1,
     aTouchers:0,
@@ -95,12 +140,10 @@ export default function App(){
   function updateEnd(i,patch){pushHistory();setEnds(prev=>prev.map((e,idx)=>idx===i?{...e,...patch}:e))}
   function removeLast(){if(!ends.length)return;pushHistory();setEnds(ends.slice(0,-1))}
 
+  // export to CSV download
   function exportCSV(){
-    const header=["End","A touchers","B touchers","Crossover shot","1st","2nd","3rd","Adj A","Adj B","Notes",`${teams.A} pts`,`${teams.B} pts`,`Detail`];
-    const rows=[header];
-    ends.forEach(e=>{const r=scoreEnd(e,cfg);rows.push([e.number,e.aTouchers,e.bTouchers,e.crossoverShot||'',e.first||'',e.second||'',e.third||'',e.adjA||0,e.adjB||0,e.notes||'',r.a,r.b,r.detail])});
-    rows.push(["Totals","","","","","","","","","",String(totals.a),String(totals.b),""]);
-    downloadCSV(`jackattack_${teams.A}_vs_${teams.B}.csv`,rows)
+    const rows = buildCSVRows(teams, ends, cfg);
+    downloadCSV(`jackattack_${teams.A}_vs_${teams.B}.csv`, rows);
   }
 
   return (
@@ -111,18 +154,29 @@ export default function App(){
 
       <div className="grid md:grid-cols-3 gap-4 mb-6">
         <Card>
-          <div className="flex items-center justify-between mb-3"><Label>Teams</Label><Button className="text-xs" onClick={()=>{pushHistory();setTeams({A:'Team A',B:'Team B'})}}>Reset</Button></div>
+          <div className="flex items-center justify-between mb-3">
+            <Label>Teams</Label>
+            <Button className="text-xs" onClick={()=>{pushHistory();setTeams({A:'Team A',B:'Team B'})}}>Reset</Button>
+          </div>
           <div className="grid grid-cols-2 gap-2">
             <div><Label>A</Label><Input value={teams.A} onChange={e=>{pushHistory();setTeams({...teams,A:e.target.value})}}/></div>
             <div><Label>B</Label><Input value={teams.B} onChange={e=>{pushHistory();setTeams({...teams,B:e.target.value})}}/></div>
           </div>
           <div className="flex items-center gap-2 mt-3">
-            <Button onClick={exportCSV}><Download className="inline w-4 h-4 mr-1"/>Export CSV</Button>
+            <Button onClick={exportCSV}>
+              <Download className="inline w-4 h-4 mr-1"/>Export CSV
+            </Button>
+            <Button onClick={sendDirect}>
+              <Send className="inline w-4 h-4 mr-1"/>Complete & Send
+            </Button>
           </div>
         </Card>
 
         <Card>
-          <div className="flex items-center justify-between mb-3"><Label>Match</Label><div className="text-xs opacity-70 flex items-center gap-2"><Timer className="w-4 h-4"/>{timeStr}</div></div>
+          <div className="flex items-center justify-between mb-3">
+            <Label>Match</Label>
+            <div className="text-xs opacity-70 flex items-center gap-2"><Timer className="w-4 h-4"/>{timeStr}</div>
+          </div>
           <div className="grid grid-cols-3 gap-2 items-end">
             <div><Label>Total Ends</Label><Input type="number" value={meta.ends} min={1} onChange={e=>{pushHistory();setMeta({...meta,ends:Number(e.target.value)})}}/></div>
             <div><Label>Total {teams.A}</Label><div className="px-3 py-2 rounded-xl border text-sm bg-white">{totals.a}</div></div>
